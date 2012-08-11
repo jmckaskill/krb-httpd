@@ -138,6 +138,7 @@ var cred *kerb.Credential
 var cookieKey []byte
 var sslCert tls.Certificate
 var runas string
+var logrules bool
 
 func init() {
 	flag.StringVar(&configFile, "config", "/etc/krb-httpd.conf", "config file")
@@ -188,7 +189,7 @@ func (m *maxLatencyWriter) WriteHeader(status int) {
 	m.dst.WriteHeader(status)
 }
 
-func (m *maxLatencyWriter) Flush() {m.dst.Flush()}
+func (m *maxLatencyWriter) Flush()              { m.dst.Flush() }
 func (m *maxLatencyWriter) Header() http.Header { return m.dst.Header() }
 
 func (m *maxLatencyWriter) flushLoop() {
@@ -209,7 +210,7 @@ func (m *maxLatencyWriter) flushLoop() {
 
 type maxLatencyHandler struct {
 	latency time.Duration
-	next http.Handler
+	next    http.Handler
 }
 
 func (m maxLatencyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -259,6 +260,14 @@ func parseConfigFile() {
 		args := strings.TrimSpace(s[cmdi:])
 
 		switch cmd {
+		case "log":
+			for _, arg := range strings.Split(args, " ") {
+				if args == "rules" {
+					logrules = true
+				} else {
+					die("unknown log %s", arg)
+				}
+			}
 		case "rule":
 			if p != nil {
 				rules = append(rules, p)
@@ -560,13 +569,13 @@ func writeCookie(w http.ResponseWriter, user string) {
 type loggedResponse struct {
 	w    http.ResponseWriter
 	r    *http.Request
-	url  string
+	url  *url.URL
 	user string
 }
 
 func (w *loggedResponse) Flush() {
 	if wf, ok := w.w.(http.Flusher); ok {
-		wf.Flush();
+		wf.Flush()
 	}
 }
 
@@ -574,11 +583,15 @@ func (w *loggedResponse) Header() http.Header         { return w.w.Header() }
 func (w *loggedResponse) Write(d []byte) (int, error) { return w.w.Write(d) }
 
 func (w *loggedResponse) WriteHeader(status int) {
-	log.Printf("%s %s \"%s %s %s\" %d", w.r.RemoteAddr, w.user, w.r.Method, w.url, w.r.Proto, status)
+	log.Printf("%s %s \"%s %s %s\" %d", w.r.RemoteAddr, w.user, w.r.Method, w.url.String(), w.r.Proto, status)
 	w.w.WriteHeader(status)
 }
 
 func (r *rule) matches(u *url.URL, gmask bitset) bool {
+	if logrules {
+		log.Printf("test rule %s %v against %s %v", r.url.String(), r.gmask, u.String(), gmask)
+	}
+
 	if r.url.Scheme != u.Scheme {
 		return false
 	}
@@ -605,19 +618,21 @@ func (r *rule) matches(u *url.URL, gmask bitset) bool {
 		}
 	}
 
-	// if no groups were specified, then we allow everyone through
-	if len(r.gmask) > 0 && !r.gmask.HasIntersection(gmask) {
-		return false
-	}
-
 	return true
 }
 
 func findRule(u *url.URL, gmask bitset) *rule {
-	for _, p := range rules {
-		if p.matches(u, gmask) {
-			return p
+	for _, r := range rules {
+		if !r.matches(u, gmask) {
+			continue
 		}
+
+		// if no groups were specified, then we allow everyone through
+		if len(r.gmask) > 0 && !r.gmask.HasIntersection(gmask) {
+			return nil
+		}
+
+		return r
 	}
 	return nil
 }
@@ -660,8 +675,8 @@ func main() {
 			syscall.Setuid(uid)
 		}
 
-		w := &loggedResponse{w2, r, r.URL.String(), ""}
-		
+		w := &loggedResponse{w2, r, r.URL, ""}
+
 		if r.URL.Host == "" {
 			r.URL.Host = r.Host
 		}
@@ -685,7 +700,9 @@ func main() {
 
 			user, realm, err := auth.Authenticate(w, r)
 			if err != nil {
-				log.Print("auth failed: ", err)
+				if err != khttp.ErrNoAuth {
+					log.Print("auth failed: ", err)
+				}
 				goto authFailed
 			}
 
@@ -730,7 +747,7 @@ func main() {
 
 	httpServer := http.Server{Addr: ":80", Handler: handler}
 	httpsServer := http.Server{
-		Addr: ":443",
+		Addr:    ":443",
 		Handler: handler,
 		TLSConfig: &tls.Config{
 			NextProtos:   []string{"http/1.1"},
