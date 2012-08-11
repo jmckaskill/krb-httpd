@@ -140,7 +140,7 @@ var sslCert tls.Certificate
 var runas string
 
 func init() {
-	flag.StringVar(&configFile, "config", "/etc/khttp-proxy.conf", "config file")
+	flag.StringVar(&configFile, "config", "/etc/krb-httpd.conf", "config file")
 }
 
 func dial(proto, realm string) (io.ReadWriteCloser, error) {
@@ -627,7 +627,7 @@ func main() {
 	var users map[string]user
 	var db *ad.DB
 
-	slog, err := syslog.New(syslog.LOG_INFO, "khttp-proxy")
+	slog, err := syslog.New(syslog.LOG_INFO, "krb-httpd")
 	check(err)
 	log.SetFlags(0)
 	log.SetOutput(slog)

@@ -1,7 +1,7 @@
 #!/bin/sh
 
 ### BEGIN INIT INFO
-# Provides:        khttp-proxy
+# Provides:        krb-httpd
 # Required-Start:  $network $remote_fs $syslog
 # Required-Stop:   $network $remote_fs $syslog
 # Default-Start:   2 3 4 5
@@ -13,19 +13,19 @@ PATH=/sbin:/bin:/usr/sbin:/usr/bin
 
 . /lib/lsb/init-functions
 
-DAEMON=/usr/local/sbin/khttp-proxy
-PIDFILE=/var/run/khttp-proxy.pid
+DAEMON=/usr/local/sbin/krb-httpd
+PIDFILE=/var/run/krb-httpd.pid
 
 test -x $DAEMON || exit 5
 
 case $1 in
 	start)
-		log_daemon_msg "Starting khttp-proxy server" "khttp-proxy"
+		log_daemon_msg "Starting krb-httpd server" "krb-httpd"
   		start-stop-daemon --start --quiet --oknodo --pidfile $PIDFILE --startas $DAEMON
 		log_end_msg $?
   		;;
 	stop)
-		log_daemon_msg "Stopping khttp-proxy server" "khttp-proxy"
+		log_daemon_msg "Stopping krb-httpd server" "krb-httpd"
   		start-stop-daemon --stop --quiet --oknodo --pidfile $PIDFILE
 		log_end_msg $?
 		rm -f $PIDFILE
@@ -44,7 +44,7 @@ case $1 in
 		exit 3
 		;;
 	status)
-		status_of_proc $DAEMON "khttp-proxy server"
+		status_of_proc $DAEMON "krb-httpd server"
 		;;
 	*)
 		echo "Usage: $0 {start|stop|restart|try-restart|force-reload|status}"
