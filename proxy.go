@@ -123,6 +123,7 @@ type rule struct {
 	stripPrefix   string
 	flushInterval time.Duration
 	handler       http.Handler
+	query url.Values
 }
 
 type user struct {
@@ -130,14 +131,15 @@ type user struct {
 	gmask bitset
 }
 
-var groups []ldap.ObjectDN
-var groupmap = make(map[ldap.ObjectDN]int)
-var rules []*rule
-var configFile string
-var cred *kerb.Credential
+var creds []*kerb.Credential
+var ldapCred *kerb.Credential
+var ldapAlias string
 var cookieKey []byte
 var sslCert tls.Certificate
 var runas string
+var groups []ldap.ObjectDN
+var groupmap = make(map[ldap.ObjectDN]int)
+var configFile string
 var logrules bool
 
 func init() {
@@ -235,14 +237,49 @@ func (u *redirector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, tgt.String(), http.StatusTemporaryRedirect)
 }
 
-func parseConfigFile() {
+var rulelk sync.Mutex
+var rules []*rule
+var cfgtime time.Time
+func getRules() []*rule {
+	rulelk.Lock()
+	defer rulelk.Unlock()
+
 	f, err := os.Open(configFile)
-	check(err)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		log.Print(err)
+		return nil
+	}
+	if st.ModTime() == cfgtime {
+		return rules
+	}
+
+	cfgtime = st.ModTime()
+	rules, err = parseConfigFile(false)
+	if err != nil {
+		log.Print(err)
+	}
+	log.Print("reloaded config file")
+	return rules
+}
+
+func parseConfigFile(init bool) ([]*rule, error) {
+	f, err := os.Open(configFile)
+	if err != nil {
+		return nil, err
+	}
 	defer f.Close()
 
 	r := bufio.NewReader(f)
 	var p *rule
 	var sslCrtFile, sslKeyFile string
+	var rules []*rule
+
+	logrules = false
 
 	for err == nil {
 		var s string
@@ -265,7 +302,7 @@ func parseConfigFile() {
 				if args == "rules" {
 					logrules = true
 				} else {
-					die("unknown log %s", arg)
+					return nil, fmt.Errorf("unknown log %s", arg)
 				}
 			}
 		case "rule":
@@ -274,19 +311,26 @@ func parseConfigFile() {
 			}
 			p = new(rule)
 			p.url, err = url.Parse(args)
-			check(err)
+			if err == nil && p.url.Scheme == "" {
+				p.url, err = url.Parse("any://" + args)
+			}
+			if err != nil {
+				return nil, err
+			}
+			p.query = p.url.Query()
+
 			_, err = path.Match(p.url.Host, "")
 			if err != nil {
-				die(err, p.url.Host)
+				return nil, err
 			}
 			_, err = path.Match(p.url.Path, "")
 			if err != nil {
-				die(err, p.url.Path)
+				return nil, err
 			}
 		case "group":
 			a := strings.SplitN(args, " ", 2)
 			if len(a) < 2 {
-				die("invalid group should be 'group <name> <dn>'")
+				return nil, fmt.Errorf("invalid group should be 'group <name> <dn>'")
 			}
 			dn := ldap.ObjectDN(a[1])
 			gidx, ok := groupmap[dn]
@@ -309,43 +353,76 @@ func parseConfigFile() {
 			p.stripPrefix = args
 		case "proxy":
 			u, err := url.Parse(args)
-			check(err)
+			if err != nil {
+				return nil, err
+			}
 			p.handler = httputil.NewSingleHostReverseProxy(u)
+		case "flush-interval":
+			p.flushInterval, err = time.ParseDuration(args)
+			if err != nil {
+				return nil, err
+			}
+		case "redirect":
+			u, err := url.Parse(args)
+			if err != nil {
+				return nil, err
+			}
+			p.handler = (*redirector)(u)
+		}
+
+		// Don't run init commands after bootup as we've probably
+		// changed user and can no longer open the files
+		if !init {
+			continue
+		}
+
+		switch cmd {
+		case "ldap-key":
+			s := strings.SplitN(args, " ", 2)
+			if len(s) < 2 {
+				return nil, fmt.Errorf("invalid ldap-key expected <alias> <key file>")
+			}
+			file, err := os.Open(s[1])
+			if err != nil {
+				return nil, err
+			}
+			c, err := kerb.ReadKeytab(file, &kerb.CredConfig{Dial: dial})
+			file.Close()
+			if err != nil || len(c) < 1 {
+				return nil, fmt.Errorf("invalid keytab %v %v", s[1], err)
+			}
+			ldapCred = c[0]
+			ldapAlias = s[0]
+		case "krb-key":
+			file, err := os.Open(args)
+			if err != nil {
+				return nil, err
+			}
+			creds, err = kerb.ReadKeytab(file, &kerb.CredConfig{Dial: dial})
+			file.Close()
+			if err != nil || len(creds) < 1 {
+				return nil, fmt.Errorf("invalid keytab %v %v", args, err)
+			}
+		case "cookie-key":
+			cookieKey, err = ioutil.ReadFile(args)
+			if err != nil {
+				return nil, err
+			}
+		case "run-as":
+			u, err := osuser.Lookup(args)
+			if err != nil {
+				return nil, err
+			}
+			runas = u.Uid
 		case "ssl-crt":
 			sslCrtFile = args
 		case "ssl-key":
 			sslKeyFile = args
-		case "krb-key":
-			file, err := os.Open(args)
-			check(err)
-			creds, err := kerb.ReadKeytab(file, &kerb.CredConfig{Dial: dial})
-			file.Close()
-			check(err)
-			if len(creds) < 1 {
-				die("invalid keytab ", args)
-			}
-			cred = creds[0]
-			_, err = cred.GetTicket("krbtgt/CTCT.NET", nil)
-			check(err)
-		case "cookie-key":
-			cookieKey, err = ioutil.ReadFile(args)
-			check(err)
-		case "run-as":
-			u, err := osuser.Lookup(args)
-			check(err)
-			runas = u.Uid
-		case "flush-interval":
-			p.flushInterval, err = time.ParseDuration(args)
-			check(err)
-		case "redirect":
-			u, err := url.Parse(args)
-			check(err)
-			p.handler = (*redirector)(u)
 		}
 	}
 
 	if err != nil && err != io.EOF {
-		die(err)
+		return nil, err
 	}
 
 	if p != nil {
@@ -360,10 +437,6 @@ func parseConfigFile() {
 			}
 		}
 
-		if p.handler == nil {
-			die("no handler defined for ", p.url)
-		}
-
 		if len(p.stripPrefix) > 0 {
 			p.handler = http.StripPrefix(p.stripPrefix, p.handler)
 		}
@@ -373,16 +446,26 @@ func parseConfigFile() {
 		}
 	}
 
-	if sslCrtFile == "" || sslKeyFile == "" {
-		die("need to specify ssl certificate and key")
+	if init {
+		if ldapCred == nil || ldapAlias == "" {
+			return nil, fmt.Errorf("need to specify ldap key and alias")
+		}
+
+		if len(creds) < 1 {
+			return nil, fmt.Errorf("need to specify kerberos key")
+		}
+
+		if sslCrtFile == "" || sslKeyFile == "" {
+			return nil, fmt.Errorf("need to specify ssl certificate and key")
+		}
+
+		sslCert, err = tls.LoadX509KeyPair(sslCrtFile, sslKeyFile)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	if cred == nil {
-		die("need to specify kerberos key")
-	}
-
-	sslCert, err = tls.LoadX509KeyPair(sslCrtFile, sslKeyFile)
-	check(err)
+	return rules, nil
 }
 
 func resolveUsers(db *ad.DB, dn ldap.ObjectDN, users map[string]user, depth int, gmask bitset) error {
@@ -465,7 +548,7 @@ func logLines(pfx string, r io.Reader) error {
 }
 
 func runHooks(users map[string]user) error {
-	for _, r := range rules {
+	for _, r := range getRules() {
 		if r.hook == "" {
 			continue
 		}
@@ -527,6 +610,10 @@ func authCookie(r *http.Request) (string, error) {
 		return "", err
 	}
 
+	if len(val) < md5.Size {
+		return "", khttp.ErrNoAuth
+	}
+
 	sig := hmac.New(md5.New, cookieKey)
 	sig.Write(val[:len(val)-md5.Size])
 
@@ -548,13 +635,17 @@ func authCookie(r *http.Request) (string, error) {
 }
 
 func writeCookie(w http.ResponseWriter, user string) {
-	val := append([]byte(nil), time.Now().Format(time.RFC3339)...)
-	val = append(val, " "...)
-	val = append(val, user...)
+	var val []byte
 
-	sig := hmac.New(md5.New, cookieKey)
-	sig.Write(val)
-	val = sig.Sum(val)
+	if user != "" {
+		val = append(val, time.Now().Format(time.RFC3339)...)
+		val = append(val, " "...)
+		val = append(val, user...)
+
+		sig := hmac.New(md5.New, cookieKey)
+		sig.Write(val)
+		val = sig.Sum(val)
+	}
 
 	http.SetCookie(w, &http.Cookie{
 		Name:     "kerb",
@@ -587,12 +678,8 @@ func (w *loggedResponse) WriteHeader(status int) {
 	w.w.WriteHeader(status)
 }
 
-func (r *rule) matches(u *url.URL, gmask bitset) bool {
-	if logrules {
-		log.Printf("test rule %s %v against %s %v", r.url.String(), r.gmask, u.String(), gmask)
-	}
-
-	if r.url.Scheme != u.Scheme {
+func (r *rule) matches(u *url.URL) bool {
+	if r.url.Scheme != "any" && r.url.Scheme != u.Scheme {
 		return false
 	}
 
@@ -600,31 +687,44 @@ func (r *rule) matches(u *url.URL, gmask bitset) bool {
 		return false
 	}
 
-	if r.url.Path == "/" || r.url.Path == "" {
+	rdir := r.url.Path
+	if rdir == "/" || rdir == "" {
 		// catch all
-	} else if strings.HasSuffix(r.url.Path, "/") {
+	} else {
+		if strings.HasSuffix(rdir, "/") {
+			rdir = rdir[:len(rdir)-1]
+		}
 		dir := u.Path
 		ok := false
 		for dir != "/" && !ok {
-			ok, _ = path.Match(r.url.Path[:len(r.url.Path)-1], dir)
+			ok, _ = path.Match(rdir, dir)
 			dir = path.Dir(dir)
 		}
 		if !ok {
 			return false
 		}
-	} else {
-		if ok, _ := path.Match(r.url.Path, u.Path); !ok {
-			return false
+	}
+
+	if len(r.query) > 0 {
+		q2 := u.Query()
+		for k,s := range r.query {
+			if len(s) > 0 && s[0] != q2.Get(k) {
+				return false
+			}
 		}
 	}
 
 	return true
 }
 
-func findRule(u *url.URL, gmask bitset) *rule {
-	for _, r := range rules {
-		if !r.matches(u, gmask) {
+func findHandler(u *url.URL, gmask bitset) http.Handler {
+	for _, r := range getRules() {
+		if !r.matches(u) {
 			continue
+		}
+
+		if logrules {
+			log.Printf("rule matches %s %s", r.url.String(), u.String())
 		}
 
 		// if no groups were specified, then we allow everyone through
@@ -632,15 +732,19 @@ func findRule(u *url.URL, gmask bitset) *rule {
 			return nil
 		}
 
-		return r
+		if r.handler != nil {
+			return r.handler
+		}
 	}
-	return nil
+
+	return nil;
 }
 
 func main() {
 	var userlk sync.Mutex
 	var users map[string]user
 	var db *ad.DB
+	var err error
 
 	slog, err := syslog.New(syslog.LOG_INFO, "krb-httpd")
 	check(err)
@@ -648,11 +752,12 @@ func main() {
 	log.SetOutput(slog)
 
 	flag.Parse()
-	parseConfigFile()
+	rules, err = parseConfigFile(true)
+	check(err)
 
-	httpAuth := khttp.NewAuthenticator(cred, &khttp.AuthConfig{Negotiate: true})
+	httpAuth := khttp.NewAuthenticator(creds, &khttp.AuthConfig{Negotiate: true})
 
-	httpsAuth := khttp.NewAuthenticator(cred, &khttp.AuthConfig{
+	httpsAuth := khttp.NewAuthenticator(creds, &khttp.AuthConfig{
 		BasicLookup: func(u string) (string, string, error) {
 			userlk.Lock()
 			d := db
@@ -669,7 +774,7 @@ func main() {
 	handler := http.HandlerFunc(func(w2 http.ResponseWriter, r *http.Request) {
 		var u user
 		var uok bool
-		var rule *rule
+		var handler http.Handler
 
 		if uid, err := strconv.Atoi(runas); err == nil {
 			syscall.Setuid(uid)
@@ -691,10 +796,10 @@ func main() {
 
 		if w.user == "" {
 			// See if there is a rule that doesn't require auth
-			rule = findRule(r.URL, nil)
-			if rule != nil {
+			handler := findHandler(r.URL, nil)
+			if handler != nil {
 				r.Header.Del("Authorization")
-				rule.handler.ServeHTTP(w, r)
+				handler.ServeHTTP(w, r)
 				return
 			}
 
@@ -707,12 +812,14 @@ func main() {
 			}
 
 			w.user = fmt.Sprintf("%s@%s", strings.ToLower(user), strings.ToUpper(realm))
+
+			// The cookie is not one-shot so is insecure for us
+			// over unencrypted channels
 			if r.TLS != nil {
 				writeCookie(w, w.user)
 			}
 		}
 
-		r.Header.Del("Authorization")
 
 		userlk.Lock()
 		if users == nil {
@@ -727,20 +834,19 @@ func main() {
 			goto authFailed
 		}
 
-		if r.URL.Host == "" {
-			r.URL.Host = r.Host
+		handler = findHandler(r.URL, u.gmask)
+		if handler != nil {
+			r.Header.Del("Authorization")
+			r.Header.Set("Remote-User", w.user)
+			handler.ServeHTTP(w, r)
+			return
 		}
-
-		rule = findRule(r.URL, u.gmask)
-		if rule == nil {
-			goto authFailed
-		}
-
-		r.Header.Set("Remote-User", w.user)
-		rule.handler.ServeHTTP(w, r)
-		return
 
 	authFailed:
+		if _, err := r.Cookie("kerb"); err != http.ErrNoCookie {
+			writeCookie(w, "")
+		}
+
 		auth.SetAuthHeader(w)
 		w.WriteHeader(http.StatusUnauthorized)
 	})
@@ -770,7 +876,7 @@ func main() {
 	go httpsServer.Serve(tls.NewListener(httpsConn, httpsServer.TLSConfig))
 
 	for {
-		newdb := ad.New(cred, cred.Realm())
+		newdb := ad.New(ldapCred, ldapAlias)
 		newusers, err := getUsers(newdb)
 		if err != nil {
 			log.Print("LDAP failed:", err)
