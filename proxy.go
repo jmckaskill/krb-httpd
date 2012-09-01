@@ -141,6 +141,8 @@ var groups []ldap.ObjectDN
 var groupmap = make(map[ldap.ObjectDN]int)
 var configFile string
 var logrules bool
+var loggroups bool
+var logheaders bool
 
 func init() {
 	flag.StringVar(&configFile, "config", "/etc/krb-httpd.conf", "config file")
@@ -240,7 +242,7 @@ func (u *redirector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 var rulelk sync.Mutex
 var rules []*rule
 var cfgtime time.Time
-func getRules() []*rule {
+func getRules(init bool) []*rule {
 	rulelk.Lock()
 	defer rulelk.Unlock()
 
@@ -259,11 +261,15 @@ func getRules() []*rule {
 	}
 
 	cfgtime = st.ModTime()
-	rules, err = parseConfigFile(false)
+	rules, err = parseConfigFile(init)
 	if err != nil {
-		log.Print(err)
+		if init {
+			die(err)
+		} else {
+			log.Print(err)
+		}
 	}
-	log.Print("reloaded config file")
+	log.Print("loaded config file")
 	return rules
 }
 
@@ -280,6 +286,8 @@ func parseConfigFile(init bool) ([]*rule, error) {
 	var rules []*rule
 
 	logrules = false
+	loggroups = false
+	logheaders = false
 
 	for err == nil {
 		var s string
@@ -299,8 +307,12 @@ func parseConfigFile(init bool) ([]*rule, error) {
 		switch cmd {
 		case "log":
 			for _, arg := range strings.Split(args, " ") {
-				if args == "rules" {
+				if arg == "rules" {
 					logrules = true
+				} else if arg == "headers" {
+					logheaders = true
+				} else if arg == "groups" {
+					loggroups = true
 				} else {
 					return nil, fmt.Errorf("unknown log %s", arg)
 				}
@@ -338,6 +350,9 @@ func parseConfigFile(init bool) ([]*rule, error) {
 				groupmap[dn] = len(groups)
 				gidx = len(groups)
 				groups = append(groups, dn)
+				if loggroups {
+					log.Printf("adding group %s %v", dn, gidx)
+				}
 			}
 			p.groups = append(p.groups, ruleGroup{gidx, a[0], dn})
 			p.gmask.Set(gidx)
@@ -468,7 +483,7 @@ func parseConfigFile(init bool) ([]*rule, error) {
 	return rules, nil
 }
 
-func resolveUsers(db *ad.DB, dn ldap.ObjectDN, users map[string]user, depth int, gmask bitset) error {
+func resolveUsers(db *ad.DB, dn ldap.ObjectDN, users map[string]*user, depth int, gmask bitset) error {
 	if depth == 0 {
 		return errors.New("reached max group depth")
 	}
@@ -482,9 +497,11 @@ func resolveUsers(db *ad.DB, dn ldap.ObjectDN, users map[string]user, depth int,
 	case *ad.User:
 		pr := fmt.Sprintf("%s@%s", strings.ToLower(u.SAMAccountName), u.Realm)
 		if u2, ok := users[pr]; ok {
+			log.Print(pr, u2.gmask, gmask)
 			u2.gmask.SetMulti(gmask)
+			log.Print(pr, u2.gmask)
 		} else {
-			users[pr] = user{u, gmask.Clone()}
+			users[pr] = &user{u, gmask.Clone()}
 		}
 
 	case *ad.Group:
@@ -493,6 +510,9 @@ func resolveUsers(db *ad.DB, dn ldap.ObjectDN, users map[string]user, depth int,
 			gidx = len(groups)
 			groupmap[u.DN] = gidx
 			groups = append(groups, u.DN)
+			if loggroups {
+				log.Printf("adding group %s %v", dn, gidx)
+			}
 		}
 
 		mask := gmask.Clone()
@@ -510,8 +530,8 @@ func resolveUsers(db *ad.DB, dn ldap.ObjectDN, users map[string]user, depth int,
 	return nil
 }
 
-func getUsers(db *ad.DB) (map[string]user, error) {
-	users := make(map[string]user)
+func getUsers(db *ad.DB) (map[string]*user, error) {
+	users := make(map[string]*user)
 
 	// If we encounter any errors collecting the user list from LDAP, we
 	// error out and leave the users map in its current state. This is to
@@ -547,8 +567,8 @@ func logLines(pfx string, r io.Reader) error {
 	return nil
 }
 
-func runHooks(users map[string]user) error {
-	for _, r := range getRules() {
+func runHooks(users map[string]*user) error {
+	for _, r := range getRules(false) {
 		if r.hook == "" {
 			continue
 		}
@@ -679,10 +699,6 @@ func (w *loggedResponse) WriteHeader(status int) {
 }
 
 func (r *rule) matches(u *url.URL) bool {
-	if r.url.Scheme != "any" && r.url.Scheme != u.Scheme {
-		return false
-	}
-
 	if r.url.Host != u.Host {
 		return false
 	}
@@ -717,32 +733,32 @@ func (r *rule) matches(u *url.URL) bool {
 	return true
 }
 
-func findHandler(u *url.URL, gmask bitset) http.Handler {
-	for _, r := range getRules() {
+func findRule(u *url.URL) (*rule, bitset) {
+	var gmask bitset
+	for _, r := range getRules(false) {
 		if !r.matches(u) {
 			continue
 		}
 
 		if logrules {
-			log.Printf("rule matches %s %s", r.url.String(), u.String())
+			log.Printf("rule matches %s %s %v", r.url.String(), u.String(), r.gmask)
 		}
 
-		// if no groups were specified, then we allow everyone through
-		if len(r.gmask) > 0 && !r.gmask.HasIntersection(gmask) {
-			return nil
+		if len(r.gmask) > 0 {
+			gmask = r.gmask
 		}
 
 		if r.handler != nil {
-			return r.handler
+			return r, gmask
 		}
 	}
 
-	return nil;
+	return nil, nil
 }
 
 func main() {
 	var userlk sync.Mutex
-	var users map[string]user
+	var users map[string]*user
 	var db *ad.DB
 	var err error
 
@@ -752,8 +768,7 @@ func main() {
 	log.SetOutput(slog)
 
 	flag.Parse()
-	rules, err = parseConfigFile(true)
-	check(err)
+	getRules(true)
 
 	httpAuth := khttp.NewAuthenticator(creds, &khttp.AuthConfig{Negotiate: true})
 
@@ -771,39 +786,48 @@ func main() {
 		Negotiate:  true,
 	})
 
-	handler := http.HandlerFunc(func(w2 http.ResponseWriter, r *http.Request) {
-		var u user
+	handler := http.HandlerFunc(func(w2 http.ResponseWriter, req *http.Request) {
+		var u *user
 		var uok bool
-		var handler http.Handler
+
+		if logheaders {
+			log.Print(*req)
+		}
 
 		if uid, err := strconv.Atoi(runas); err == nil {
 			syscall.Setuid(uid)
 		}
 
-		w := &loggedResponse{w2, r, r.URL, ""}
+		w := &loggedResponse{w2, req, req.URL, ""}
 
-		if r.URL.Host == "" {
-			r.URL.Host = r.Host
+		if req.URL.Host == "" {
+			req.URL.Host = req.Host
 		}
 
 		auth := httpAuth
-		r.URL.Scheme = "http"
-		if r.TLS != nil {
-			w.user, _ = authCookie(r)
+		req.URL.Scheme = "http"
+		if req.TLS != nil {
 			auth = httpsAuth
-			r.URL.Scheme = "https"
+			req.URL.Scheme = "https"
 		}
 
-		if w.user == "" {
-			// See if there is a rule that doesn't require auth
-			handler := findHandler(r.URL, nil)
-			if handler != nil {
-				r.Header.Del("Authorization")
-				handler.ServeHTTP(w, r)
-				return
-			}
+		rule, gmask := findRule(req.URL)
 
-			user, realm, err := auth.Authenticate(w, r)
+		if rule == nil || (rule.url.Scheme != "any" && rule.url.Scheme != req.URL.Scheme) {
+			goto authFailed
+		}
+
+		// See if the rule doesn't require auth
+		if len(gmask) == 0 {
+			req.Header.Del("Authorization")
+			rule.handler.ServeHTTP(w, req)
+			return
+		}
+
+		w.user, _ = authCookie(req)
+
+		if w.user == "" {
+			user, realm, err := auth.Authenticate(w, req)
 			if err != nil {
 				if err != khttp.ErrNoAuth {
 					log.Print("auth failed: ", err)
@@ -813,13 +837,12 @@ func main() {
 
 			w.user = fmt.Sprintf("%s@%s", strings.ToLower(user), strings.ToUpper(realm))
 
-			// The cookie is not one-shot so is insecure for us
-			// over unencrypted channels
-			if r.TLS != nil {
+			// The cookie is not one-shot so is insecure over
+			// unencrypted channels
+			if req.TLS != nil {
 				writeCookie(w, w.user)
 			}
 		}
-
 
 		userlk.Lock()
 		if users == nil {
@@ -834,16 +857,40 @@ func main() {
 			goto authFailed
 		}
 
-		handler = findHandler(r.URL, u.gmask)
-		if handler != nil {
-			r.Header.Del("Authorization")
-			r.Header.Set("Remote-User", w.user)
-			handler.ServeHTTP(w, r)
+		if logrules {
+			log.Printf("group check have %v need %v", u.gmask, gmask)
+		}
+
+		if gmask.HasIntersection(u.gmask) {
+			req.Header.Del("Authorization")
+			req.Header.Set("Remote-User", w.user)
+			req.Header.Set("Remote-Name", u.DisplayName)
+			req.Header.Set("Remote-Email", strings.ToLower(u.Mail))
+			rule.handler.ServeHTTP(w, req)
 			return
 		}
 
 	authFailed:
-		if _, err := r.Cookie("kerb"); err != http.ErrNoCookie {
+		// See if we need to redirect between http/https. We prefer
+		// https if the config file doesn't specify anything, but if
+		// the user has already provided auth on http then we go with
+		// it.
+		if rule != nil && (rule.url.Scheme != "any" || req.Header.Get("Authorization") == "") {
+			want := rule.url.Scheme
+			if want == "any" {
+				want = "https"
+			}
+
+			if want != req.URL.Scheme {
+				tgt := new(url.URL)
+				*tgt = *req.URL
+				tgt.Scheme = want
+				http.Redirect(w, req, tgt.String(), http.StatusTemporaryRedirect)
+				return
+			}
+		}
+
+		if _, err := req.Cookie("kerb"); err != http.ErrNoCookie {
 			writeCookie(w, "")
 		}
 
