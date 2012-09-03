@@ -893,7 +893,11 @@ func main() {
 		}
 
 		auth.SetAuthHeader(w)
-		w.WriteHeader(http.StatusUnauthorized)
+		if w.user == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+		} else {
+			w.WriteHeader(http.StatusForbidden)
+		}
 	})
 
 	httpServer := http.Server{Addr: ":80", Handler: handler}
