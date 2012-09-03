@@ -497,9 +497,7 @@ func resolveUsers(db *ad.DB, dn ldap.ObjectDN, users map[string]*user, depth int
 	case *ad.User:
 		pr := fmt.Sprintf("%s@%s", strings.ToLower(u.SAMAccountName), u.Realm)
 		if u2, ok := users[pr]; ok {
-			log.Print(pr, u2.gmask, gmask)
 			u2.gmask.SetMulti(gmask)
-			log.Print(pr, u2.gmask)
 		} else {
 			users[pr] = &user{u, gmask.Clone()}
 		}
