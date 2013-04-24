@@ -648,7 +648,7 @@ func writeCookie(w http.ResponseWriter, user string) {
 type loggedResponse struct {
 	w    http.ResponseWriter
 	r    *http.Request
-	url  *url.URL
+	url  string
 	user string
 }
 
@@ -662,7 +662,7 @@ func (w *loggedResponse) Header() http.Header         { return w.w.Header() }
 func (w *loggedResponse) Write(d []byte) (int, error) { return w.w.Write(d) }
 
 func (w *loggedResponse) WriteHeader(status int) {
-	log.Printf("%s %s \"%s %s %s\" %d", w.r.RemoteAddr, w.user, w.r.Method, w.url.String(), w.r.Proto, status)
+	log.Printf("%s %s \"%s %s %s\" %d", w.r.RemoteAddr, w.user, w.r.Method, w.url, w.r.Proto, status)
 	w.w.WriteHeader(status)
 }
 
@@ -842,7 +842,7 @@ func main() {
 			syscall.Setuid(uid)
 		}
 
-		w := &loggedResponse{w2, req, req.URL, ""}
+		w := &loggedResponse{w2, req, req.URL.String(), ""}
 
 		if req.URL.Host == "" {
 			req.URL.Host = req.Host
