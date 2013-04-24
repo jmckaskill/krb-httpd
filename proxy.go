@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/md5"
+	"crypto/rand"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
@@ -423,11 +424,6 @@ func parseConfigFile(init bool) ([]*rule, error) {
 			if err != nil || len(creds) < 1 {
 				return nil, fmt.Errorf("invalid keytab %v %v", args, err)
 			}
-		case "cookie-key":
-			cookieKey, err = ioutil.ReadFile(args)
-			if err != nil {
-				return nil, err
-			}
 		case "run-as":
 			u, err := osuser.Lookup(args)
 			if err != nil {
@@ -834,6 +830,10 @@ func main() {
 	var users map[string]*user
 	var db *ad.DB
 	var err error
+
+	cookieKey := make([]byte, 512)
+	_, err = io.ReadFull(rand.Reader, cookieKey)
+	check(err)
 
 	slog, err := syslog.New(syslog.LOG_INFO, "krb-httpd")
 	check(err)
