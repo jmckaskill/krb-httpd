@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/hmac"
 	"crypto/md5"
 	"crypto/subtle"
@@ -31,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -759,6 +761,72 @@ func findRule(u *url.URL) (*rule, bitset) {
 	}
 
 	return nil, nil
+}
+
+type logListener struct {
+	sock    net.Listener
+	pfx     string
+	counter uint32
+}
+
+func (l *logListener) Close() error   { return l.sock.Close() }
+func (l *logListener) Addr() net.Addr { return l.sock.Addr() }
+
+func newLogListener(sock net.Listener, pfx string) net.Listener {
+	return &logListener{sock, pfx, 0}
+}
+
+func (l *logListener) Accept() (net.Conn, error) {
+	c, err := l.sock.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	ra := c.RemoteAddr()
+	cnt := atomic.AddUint32(&l.counter, 1)
+	pfx := fmt.Sprintf("%s.%d.%s", l.pfx, cnt, ra)
+	rxlog, err := os.Create(pfx + ".rx")
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+	txlog, err := os.Create(pfx + ".tx")
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+
+	return &logConnection{c, rxlog, txlog}, nil
+}
+
+type logConnection struct {
+	sock net.Conn
+	rx   io.WriteCloser
+	tx   io.WriteCloser
+}
+
+func (l *logConnection) LocalAddr() net.Addr                { return l.sock.LocalAddr() }
+func (l *logConnection) RemoteAddr() net.Addr               { return l.sock.RemoteAddr() }
+func (l *logConnection) SetDeadline(t time.Time) error      { return l.sock.SetDeadline(t) }
+func (l *logConnection) SetReadDeadline(t time.Time) error  { return l.sock.SetReadDeadline(t) }
+func (l *logConnection) SetWriteDeadline(t time.Time) error { return l.sock.SetWriteDeadline(t) }
+
+func (l *logConnection) Close() error {
+	l.rx.Close()
+	l.tx.Close()
+	return l.sock.Close()
+}
+
+func (l *logConnection) Read(b []byte) (n int, err error) {
+	n, err = l.sock.Read(b)
+	io.Copy(l.rx, bytes.NewBuffer(b[:n]))
+	return n, err
+}
+
+func (l *logConnection) Write(b []byte) (n int, err error) {
+	n, err = l.sock.Write(b)
+	io.Copy(l.tx, bytes.NewBuffer(b[:n]))
+	return n, err
 }
 
 func main() {
