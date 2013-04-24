@@ -903,6 +903,9 @@ func main() {
 		} else {
 			w.WriteHeader(http.StatusForbidden)
 		}
+
+		// Git behaves a bit funny if you don't consume all of its POST data
+		io.Copy(ioutil.Discard, req.Body)
 	})
 
 	httpServer := http.Server{Addr: ":80", Handler: handler}
