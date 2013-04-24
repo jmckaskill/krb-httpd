@@ -566,56 +566,25 @@ func logLines(pfx string, r io.Reader) error {
 	return nil
 }
 
-func runHooks(users map[string]*user) error {
-	for _, r := range getRules(false) {
+func runhooks(u *user) {
+	user := strings.ToLower(u.SAMAccountName)
+	for _, r := range rules {
 		if r.hook == "" {
 			continue
 		}
-
 		h := exec.Command(r.hook)
-		w, err := h.StdinPipe()
-		if err != nil {
-			return err
-		}
-		stderr, err := h.StderrPipe()
-		if err != nil {
-			return err
-		}
+		h.Env = os.Environ()
+		h.Env = append(h.Env, "HOOK_REALM="+u.Realm)
+		h.Env = append(h.Env, "HOOK_USER="+user)
+		h.Env = append(h.Env, "HOOK_FULLNAME="+u.DisplayName)
+		h.Env = append(h.Env, "HOOK_MAIL="+u.Mail)
 
-		go logLines(fmt.Sprintf("hook %s: ", r.hook), stderr)
-
-		err = h.Start()
-		if err != nil {
-			return err
-		}
-
-		for pr, u := range users {
-			if !u.gmask.HasIntersection(r.gmask) {
-				continue
-			}
-
-			fmt.Fprintf(w, "user %s\n", pr)
-			fmt.Fprintf(w, "dn %s\n", u.DN)
-			fmt.Fprintf(w, "sid %s\n", u.ObjectSID)
-			fmt.Fprintf(w, "name %s\n", u.DisplayName)
-			fmt.Fprintf(w, "email %s\n", u.Mail)
-			for _, g := range r.groups {
-				if u.gmask.Test(g.gid) {
-					fmt.Fprintf(w, "group %s %s\n", g.name, g.dn)
-				}
-			}
-			fmt.Fprint(w, "\n")
-		}
-
-		fmt.Print(w, "\n")
-		w.Close()
-		err = h.Wait()
-		if err != nil {
-			return err
+		out, _ := h.CombinedOutput()
+		for b := bytes.NewBuffer(out); b.Len() > 0; {
+			line, _ := b.ReadString('\n')
+			log.Printf("hook %s %s@%s: %s", r.url, user, u.Realm, strings.Trim(string(line), "\r\n"))
 		}
 	}
-
-	return nil
 }
 
 func authCookie(r *http.Request) (string, error) {
@@ -900,6 +869,7 @@ func main() {
 		}
 
 		w.user, _ = authCookie(req)
+		newuser := w.user == ""
 
 		if w.user == "" {
 			user, realm, err := auth.Authenticate(w, req)
@@ -934,6 +904,10 @@ func main() {
 
 		if logrules {
 			log.Printf("group check have %v need %v", u.gmask, gmask)
+		}
+
+		if newuser {
+			runhooks(u)
 		}
 
 		if gmask.HasIntersection(u.gmask) {
@@ -1011,12 +985,6 @@ func main() {
 		newusers, err := getUsers(newdb)
 		if err != nil {
 			log.Print("LDAP failed:", err)
-			goto sleep
-		}
-
-		err = runHooks(newusers)
-		if err != nil {
-			log.Print("Hook failed:", err)
 			goto sleep
 		}
 
