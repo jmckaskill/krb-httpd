@@ -124,7 +124,7 @@ type rule struct {
 	stripPrefix   string
 	flushInterval time.Duration
 	handler       http.Handler
-	query url.Values
+	query         url.Values
 }
 
 type user struct {
@@ -244,6 +244,7 @@ func (u *redirector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 var rulelk sync.Mutex
 var rules []*rule
 var cfgtime time.Time
+
 func getRules(init bool) []*rule {
 	rulelk.Lock()
 	defer rulelk.Unlock()
@@ -699,6 +700,10 @@ func (w *loggedResponse) WriteHeader(status int) {
 }
 
 func (r *rule) matches(u *url.URL) bool {
+	if r.url.Scheme != "any" && r.url.Scheme != u.Scheme {
+		return false
+	}
+
 	if r.url.Host != u.Host {
 		return false
 	}
@@ -723,7 +728,7 @@ func (r *rule) matches(u *url.URL) bool {
 
 	if len(r.query) > 0 {
 		q2 := u.Query()
-		for k,s := range r.query {
+		for k, s := range r.query {
 			if len(s) > 0 && s[0] != q2.Get(k) {
 				return false
 			}
@@ -782,7 +787,7 @@ func main() {
 			}
 			return d.ResolvePrincipal(u)
 		},
-		BasicRealm: "Windows Domain Logon (e.g. AM\\User)",
+		BasicRealm: "Windows Domain Logon (e.g. AM/User)",
 		Negotiate:  true,
 	})
 
@@ -814,9 +819,9 @@ func main() {
 		}
 
 		rule, gmask := findRule(req.URL)
-
-		if rule == nil || (rule.url.Scheme != "any" && rule.url.Scheme != req.URL.Scheme) {
-			goto authFailed
+		if rule == nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
 		}
 
 		// See if the rule doesn't require auth
@@ -873,23 +878,19 @@ func main() {
 		}
 
 	authFailed:
-		// See if we need to redirect between http/https. We prefer
-		// https if the config file doesn't specify anything, but if
-		// the user has already provided auth on http then we go with
-		// it.
-		if rule != nil && (rule.url.Scheme != "any" || req.Header.Get("Authorization") == "") {
-			want := rule.url.Scheme
-			if want == "any" {
-				want = "https"
-			}
+		// See if we need to redirect to https. We prefer https if the
+		// config file doesn't specify anything, but if the user has
+		// already provided auth on http then we go with it.
+		if rule != nil &&
+			rule.url.Scheme == "any" &&
+			req.TLS == nil &&
+			req.Header.Get("Authorization") == "" {
 
-			if want != req.URL.Scheme {
-				tgt := new(url.URL)
-				*tgt = *req.URL
-				tgt.Scheme = want
-				http.Redirect(w, req, tgt.String(), http.StatusTemporaryRedirect)
-				return
-			}
+			tgt := new(url.URL)
+			*tgt = *req.URL
+			tgt.Scheme = "https"
+			http.Redirect(w, req, tgt.String(), http.StatusTemporaryRedirect)
+			return
 		}
 
 		if _, err := req.Cookie("kerb"); err != http.ErrNoCookie {
