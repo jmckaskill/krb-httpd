@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	osuser "os/user"
 	"path"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -197,6 +198,7 @@ func (m *maxLatencyWriter) Flush()              { m.dst.Flush() }
 func (m *maxLatencyWriter) Header() http.Header { return m.dst.Header() }
 
 func (m *maxLatencyWriter) flushLoop() {
+	runtime.LockOSThread()
 	t := time.NewTicker(m.latency)
 	defer t.Stop()
 	for {
@@ -792,6 +794,8 @@ func main() {
 			log.Print(*req)
 		}
 
+		runtime.LockOSThread()
+
 		if uid, err := strconv.Atoi(runas); err == nil {
 			syscall.Setuid(uid)
 		}
@@ -921,8 +925,14 @@ func main() {
 	err = syscall.Setuid(uid)
 	check(err)
 
-	go httpServer.Serve(httpConn)
-	go httpsServer.Serve(tls.NewListener(httpsConn, httpsServer.TLSConfig))
+	go func() {
+		runtime.LockOSThread()
+		httpServer.Serve(newLogListener(httpConn, "/tmp/http"))
+	}()
+	go func() {
+		runtime.LockOSThread()
+		httpsServer.Serve(tls.NewListener(httpsConn, httpsServer.TLSConfig))
+	}()
 
 	for {
 		newdb := ad.New(ldapCred, ldapAlias)
