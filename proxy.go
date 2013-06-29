@@ -122,7 +122,8 @@ type rule struct {
 	groups        []ruleGroup
 	hook          string
 	cgi           string
-	cgicwd        string
+	cwd           string
+	exec          []string
 	proxy         *url.URL
 	stripPrefix   string
 	flushInterval time.Duration
@@ -242,6 +243,41 @@ func (u *redirector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	tgt.Path = path.Join(tgt.Path, r.URL.Path)
 	tgt.RawQuery = r.URL.RawQuery
 	http.Redirect(w, r, tgt.String(), http.StatusTemporaryRedirect)
+}
+
+type execHandler struct {
+	args []string
+	cwd  string
+}
+
+func (e *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	cmd := exec.Command(e.args[0], e.args[1:]...)
+	cmd.Dir = e.cwd
+
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		log.Printf("cmd %v failed with %v", e.args, err)
+		return
+	}
+
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		log.Printf("cmd %v failed with %v", e.args, err)
+		return
+	}
+
+	err = cmd.Run()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		log.Printf("cmd %v failed with %v", e.args, err)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	go io.Copy(in, r.Body)
+	io.Copy(w, out)
 }
 
 var rulelk sync.Mutex
@@ -366,8 +402,10 @@ func parseConfigFile(init bool) ([]*rule, error) {
 			p.hook = args
 		case "cgi":
 			p.cgi = args
-		case "cgi-cwd":
-			p.cgicwd = args
+		case "cwd":
+			p.cwd = args
+		case "exec":
+			p.exec = strings.Split(args, " ")
 		case "filesystem":
 			p.handler = http.FileServer(http.Dir(args))
 		case "strip-prefix":
@@ -449,8 +487,12 @@ func parseConfigFile(init bool) ([]*rule, error) {
 		if len(p.cgi) > 0 {
 			p.handler = &cgi.Handler{
 				Path: p.cgi,
-				Dir:  p.cgicwd,
+				Dir:  p.cwd,
 			}
+		}
+
+		if p.exec != nil {
+			p.handler = &execHandler{p.exec, p.cwd}
 		}
 
 		if len(p.stripPrefix) > 0 {
